@@ -113,13 +113,12 @@ async def play(interaction: discord.Interaction, message: str):
       return
 
     await interaction.response.defer()  # Show "thinking..."
-    user_id = interaction.user.id
     user_name = interaction.user.name
     try:
       openAIClient.beta.threads.messages.create(
          thread_id=current_thread_id,
          role="user",
-         content=f"[User ID: {user_id}]\n{message}",
+         content=f"[User ID: {user_name}]\n{message}",
       )
 
       run = openAIClient.beta.threads.runs.create(
