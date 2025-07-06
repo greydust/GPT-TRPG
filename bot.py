@@ -9,6 +9,8 @@ import atexit
 import configparser
 import threading
 import traceback
+from collections import deque
+import random
 
 
 config = configparser.ConfigParser()
@@ -25,10 +27,12 @@ RULE_SET = {
   "main": {
     "file_name": rule_set['MAIN']['FILE_NAME'],
     "version": rule_set['MAIN']['VERSION'],
+    "rule_set": rule_set['MAIN']['RULE_SET'],
   }, 
   "character_creation": {
     "file_name": rule_set['CHARACTER_CREATION']['FILE_NAME'],
     "version": rule_set['CHARACTER_CREATION']['VERSION'],
+    "rule_set": rule_set['CHARACTER_CREATION']['RULE_SET'],
   },
   "ability_check": {
     "file_name": rule_set['ABILITY_CHECK']['FILE_NAME'],
@@ -41,6 +45,8 @@ RULE_SET = {
 }
 
 SAVES_FILE = "saves.json"
+CHARACTER_FOLDER = "characters"
+SUMMARY_THRESHOLD_TOKEN = 10000
 
 CHARACTER_CREATION_INTRO = [
   "從霧氣瀰漫的狹海彼岸，命運的長路悄然展開。",
@@ -50,45 +56,90 @@ CHARACTER_CREATION_INTRO = [
   "從古老學城的鐘聲到風息堡的遠影，我的旅程，悄然啟動。",
 ]
 
-class CharacterCreationState(Enum):
+class PlayerState(Enum):
   NOT_STARTED = 0
   CHARACTER_CREATION = 1
   JOINED = 2
+
+class CharacterCreationState(Enum):
+  NOT_STARTED = 0
+  CHARACTER_CREATION = 1
+  CREATED = 2
 
 class SessionState(Enum):
   NOT_STARTED = 0
   STARTED = 1
   ENDED = 2
 
-# Custom JSON encoder and decoder for Enums
 class EnumEncoder(json.JSONEncoder):
   def default(self, obj):
     if isinstance(obj, Enum):
-      return obj.name  # Serialize Enum as its name
+      return f"{obj.__class__.__name__}__{obj.name}"
     return super().default(obj)
 
 def enum_decoder(dct):
   for key, value in dct.items():
-    if key == "state" and value in CharacterCreationState.__members__:
-      dct[key] = CharacterCreationState[value]
-    elif key == "state" and value in SessionState.__members__:
-      dct[key] = SessionState[value]
+    if isinstance(value, str) and "__" in value:
+      enum_class_name, enum_member_name = value.split("__", 1)
+      if enum_class_name in globals():
+        enum_class = globals()[enum_class_name]
+        if issubclass(enum_class, Enum) and enum_member_name in enum_class.__members__:
+          dct[key] = enum_class[enum_member_name]
   return dct
 
 def load_saves():
+  save = {}
+  characters = {}
+
   if os.path.exists(SAVES_FILE):
     try:
       with open(SAVES_FILE, "r", encoding="utf-8") as f:
-        return json.load(f, object_hook=enum_decoder)
+        save = json.load(f, object_hook=enum_decoder)
     except Exception as e:
       print(f"[Error] Failed to load saves: {e}")
-  return {}
+
+  if os.path.exists(CHARACTER_FOLDER):
+    try:
+      for user_id in os.listdir(CHARACTER_FOLDER):
+        user_folder = os.path.join(CHARACTER_FOLDER, user_id)
+        if os.path.isdir(user_folder):
+          characters[user_id] = {}
+          for character_file in os.listdir(user_folder):
+            if character_file.endswith(".json"):
+              character_path = os.path.join(user_folder, character_file)
+              try:
+                with open(character_path, "r", encoding="utf-8") as f:
+                  character_id = os.path.splitext(character_file)[0]
+                  characters[user_id][character_id] = json.load(f, object_hook=enum_decoder)
+              except Exception as e:
+                print(f"[Error] Failed to load character {character_file} for user {user_id}: {e}")
+    except Exception as e:
+      print(f"[Error] Failed to load characters: {e}")
+
+  return save, characters
 
 def save_saves():
   try:
     json_data = json.dumps(client.saves, ensure_ascii=False, indent=2, cls=EnumEncoder)
     with open(SAVES_FILE, "w", encoding="utf-8") as f:
       f.write(json_data)
+
+    if not os.path.exists(CHARACTER_FOLDER):
+      os.makedirs(CHARACTER_FOLDER)
+
+    for user_id, characters in client.characters.items():
+      user_folder = os.path.join(CHARACTER_FOLDER, user_id)
+      if not os.path.exists(user_folder):
+        os.makedirs(user_folder)
+
+      for character_id, character_data in characters.items():
+        character_file = os.path.join(user_folder, f"{character_id}.json")
+        try:
+          json_data = json.dumps(character_data, ensure_ascii=False, indent=2, cls=EnumEncoder)
+          with open(character_file, "w", encoding="utf-8") as f:
+            f.write(json_data)
+        except Exception as e:
+          print(f"[Error] Failed to save character {character_id} for user {user_id}: {e}")
   except Exception as e:
     print(f"[Error] Failed to save saves: {e}")
 
@@ -100,12 +151,12 @@ class GPTTRPG(discord.Client):
   def __init__(self):
     super().__init__(intents=discord.Intents.default())
     self.tree = app_commands.CommandTree(self)
-    self.saves = load_saves()
-    self.playing = {}
+    self.saves, self.characters = load_saves()
+    self.player_state = {}
     self.openAIClient = OpenAI(api_key=OPENAI_API_KEY)
-    self.message_queue = {session_name: [] for session_name in self.saves.keys()}
-    self.processing = {session_name: False for session_name in self.saves.keys()}
-    self.processing_lock = {session_name: threading.Lock() for session_name in self.saves.keys()}
+    self.message_queue = {session_id: deque() for session_id in self.saves.keys()}
+    self.processing = {session_id: False for session_id in self.saves.keys()}
+    self.processing_lock = {session_id: threading.Lock() for session_id in self.saves.keys()}
     self.rule_set = RULE_SET
 
   async def setup_hook(self):
@@ -148,29 +199,30 @@ class GPTTRPG(discord.Client):
       print(f"[Error] During assistant setup: {e}")
       traceback.print_exc()
 
-  async def create(self, interaction: discord.Interaction, session_name: str, scenario_id: str = None):
+  async def start_game(self, interaction: discord.Interaction, session_id: str, scenario_id: str = None):
     if interaction.channel.id != CHANNEL_ID:
       await interaction.response.send_message("請在gpt-trpg頻道使用此指令.", ephemeral=True)
       return
 
-    if session_name in self.saves:
-      await interaction.response.send_message(f"❌ 進度 `{session_name}` 已存在.")
+    if session_id in self.saves:
+      await interaction.response.send_message(f"❌ 進度 `{session_id}` 已存在.")
       return
 
-    self.saves[session_name] = {
+    self.saves[session_id] = {
       'scenario_id': scenario_id,
       'summary': '',
       'players': {},
       'state': SessionState.NOT_STARTED,
+      'rule_set': self.rule_set['main']['rule_set'],
     }
-    save = self.saves[session_name]
+    save = self.saves[session_id]
 
     scenario_content = None
     if scenario_id:
       scenarios_dir = os.path.join(os.path.dirname(__file__), "scenarios")
       file_path = os.path.join(scenarios_dir, f"{scenario_id}.md")
       if not os.path.exists(file_path):
-        del self.saves[session_name]
+        del self.saves[session_id]
         await interaction.response.send_message(f"❌ 找不到劇本 `{scenario_id}`。")
         return
       with open(file_path, "r", encoding="utf-8") as f:
@@ -208,7 +260,7 @@ class GPTTRPG(discord.Client):
         time.sleep(1)
 
       if run_status.status != "completed":
-          del self.saves[session_name]
+          del self.saves[session_id]
           await interaction.followup.send(f"❌ 創建進度失敗：Bot錯誤。狀態： {run_status.status}")
           return
 
@@ -221,14 +273,17 @@ class GPTTRPG(discord.Client):
               break
 
       if not assistant_reply:
-          del self.saves[session_name]
+          del self.saves[session_id]
           await interaction.followup.send("❌ 創建進度失敗：沒有收到 AI 回覆。")
           return
 
+      self.message_queue[session_id] = deque()
+      self.processing[session_id] = False
+      self.processing_lock[session_id] = threading.Lock()
       save['state'] = SessionState.STARTED
-      await interaction.followup.send(f"✅ 已創建進度 `{session_name}`\n\n**遊戲敘事:**\n{assistant_reply}")
+      await interaction.followup.send(f"✅ 已創建進度 `{session_id}`\n\n**遊戲敘事:**\n{assistant_reply}")
     except Exception as e:
-      del self.saves[session_name]
+      del self.saves[session_id]
       await interaction.followup.send(f"❌ 創建進度失敗：發生錯誤: {e}")
       traceback.print_exc()
 
@@ -245,133 +300,294 @@ class GPTTRPG(discord.Client):
       msg += f"• {name}\n"
     await interaction.response.send_message(msg)
 
-  async def summary(self, interaction: discord.Interaction, session_name: str):
+  async def session_summary(self, interaction: discord.Interaction, session_id: str):
     if interaction.channel.id != CHANNEL_ID:
       await interaction.response.send_message("請在gpt-trpg頻道使用此指令.", ephemeral=True)
       return
 
-    if session_name not in self.saves:
-      await interaction.response.send_message(f"❌ 進度 `{session_name}` 不存在.")
+    if session_id not in self.saves:
+      await interaction.response.send_message(f"❌ 進度 `{session_id}` 不存在.")
       return
 
-    summary = self.saves[session_name]['summary']
+    summary = self.saves[session_id]['summary']
     if not summary:
-      await interaction.response.send_message(f"❌ 進度 `{session_name}` 尚無摘要。")
+      await interaction.response.send_message(f"❌ 進度 `{session_id}` 尚無摘要。")
       return
 
-    await interaction.response.send_message(f"**進度 `{session_name}` 的摘要：**\n\n{summary}")
+    await interaction.response.send_message(f"**進度 `{session_id}` 的摘要：**\n\n{summary}")
 
-  async def join(self, interaction: discord.Interaction, session_name: str, message: str = None):
+  async def create_character(self, interaction: discord.Interaction, character_id: str, message: str = None):
     if interaction.channel.id != CHANNEL_ID:
       await interaction.response.send_message("請在gpt-trpg頻道使用此指令.", ephemeral=True)
       return
+    
+    user_id = str(interaction.user.id)
+    user_name = str(interaction.user.name)
 
-    if session_name not in self.saves:
-      await interaction.response.send_message(f"❌ 進度 `{session_name}` 不存在.")
-      return
-
-    if self.saves[session_name]['state'] == SessionState.NOT_STARTED:
-      await interaction.response.send_message(f"❌ 進度 `{session_name}` 創建中，請稍候。")
-      return
-
-    if self.saves[session_name]['state'] == SessionState.ENDED:
-      await interaction.response.send_message(f"❌ 進度 `{session_name}` 已結束，無法加入。")
-      return
-
-    user_id = interaction.user.id
-    user_name = interaction.user.name
-    save = self.saves[session_name]
-    if user_id in save['players']:
-      if save['players'][user_id]['state'] == CharacterCreationState.NOT_STARTED:
-        await interaction.response.send_message(f"創角中，請稍候。", ephemeral=True)
-      elif save['players'][user_id]['state'] == CharacterCreationState.CHARACTER_CREATION or save['players'][user_id]['state'] == CharacterCreationState.JOINED:
-        self.playing[user_id] = session_name
-        await interaction.response.send_message(f"✅ 已切換至進度 `{session_name}` 。", ephemeral=True)
+    if user_id not in self.characters:
+      self.characters[user_id] = {}
+    
+    if character_id in self.characters[user_id]:
+      character = self.characters[user_id][character_id]
+      if character['state'] == CharacterCreationState.CREATED:
+        await interaction.response.send_message(f"❌ 角色 `{character_id}` 已存在，請使用其他ID。", ephemeral=True)
+      elif character['state'] == CharacterCreationState.NOT_STARTED:
+        await interaction.response.send_message(f"❌ 角色 `{character_id}` 創建中，請稍候。", ephemeral=True)
+      elif character['state'] == CharacterCreationState.CHARACTER_CREATION:
+        self.player_state[user_id] = {
+          'state': PlayerState.CHARACTER_CREATION,
+          'character_id': character_id,
+        }
+        await interaction.response.send_message(f"繼續創建角色 `{character_id}` 。")
+      else:
+        await interaction.response.send_message(f"❌ 角色 `{character_id}` 狀態未知：{character}。請重新創建。", ephemeral=True)
       return
 
     await interaction.response.defer()
 
-    save['players'][user_id] = {
-      "state": CharacterCreationState.NOT_STARTED,
-      'character_creation': {}
+    if character_id not in self.characters[user_id]:
+      self.characters[user_id][character_id] = {
+        'state': CharacterCreationState.NOT_STARTED,
+      }
+    character = self.characters[user_id][character_id]
+    character_creation_assistant_id = self.rule_set['character_creation']['assistant_id']
+    thread = self.openAIClient.beta.threads.create()
+    character['assistant_id'] = character_creation_assistant_id
+    character['thread_id'] = thread.id
+
+    if not message:
+      message = CHARACTER_CREATION_INTRO[random.randint(0, len(CHARACTER_CREATION_INTRO) - 1)]
+
+    assistant_reply, error = self.run_and_fetch_thread_response(thread.id, character_creation_assistant_id, message)
+    if error:
+      del self.characters[user_id][character_id]
+      await interaction.followup.send(error, ephemeral=True)
+      return
+    
+    self.player_state[user_id] = {
+      'state': PlayerState.CHARACTER_CREATION,
+      'character_id': character_id,
     }
-    character_save = save['players'][user_id]
+    character['state'] = CharacterCreationState.CHARACTER_CREATION,
+    await interaction.followup.send(f"{user_name}：「{message}」\n\n**遊戲敘事:**\n{assistant_reply}")
 
-    try:
-      character_creation_assistant_id = self.rule_set['character_creation']['assistant_id']
-      thread = self.openAIClient.beta.threads.create()
-      character_save['character_creation']['assistant_id'] = character_creation_assistant_id
-      character_save['character_creation']['thread_id'] = thread.id
+  async def delete_character(self, interaction: discord.Interaction, character_id: str):
+    if interaction.channel.id != CHANNEL_ID:
+      await interaction.response.send_message("請在gpt-trpg頻道使用此指令.", ephemeral=True)
+      return
+    
+    user_id = str(interaction.user.id)
+    user_name = str(interaction.user.name)
 
-      if not message:
-        message = CHARACTER_CREATION_INTRO[hash(user_id) % len(CHARACTER_CREATION_INTRO)]
-      self.openAIClient.beta.threads.messages.create(
-        thread_id=thread.id,
-        role="user",
-        content=message
-      )
+    if user_id not in self.characters:
+      await interaction.response.send_message("目前沒有任何角色。", ephemeral=True)
+      return
+    
+    if character_id not in self.characters[user_id]:
+      await interaction.response.send_message(f"❌ 角色 `{character_id}` 不存在。", ephemeral=True)
+      return
 
-      # Retrieve the response from the assistant
-      run = self.openAIClient.beta.threads.runs.create(
-          thread_id=thread.id,
-          assistant_id=character_creation_assistant_id,
-      )
-
-      while True:
-        run_status = self.openAIClient.beta.threads.runs.retrieve(
-            thread_id=thread.id,
-            run_id=run.id
-        )
-        if run_status.status in ["completed", "failed", "cancelled", "expired"]:
-          break
-        time.sleep(1)
-
-      if run_status.status != "completed":
-        del save['players'][user_id]
-        await interaction.followup.send(f"❌ 加入進度失敗：Bot錯誤. 狀態: {run_status.status}")
+    character_file = os.path.join(CHARACTER_FOLDER, user_id, f"{character_id}.json")
+    if os.path.exists(character_file):
+      try:
+        os.remove(character_file)
+      except Exception as e:
+        await interaction.response.send_message(f"❌ 無法刪除角色檔案 `{character_id}`: {e}", ephemeral=True)
         return
+    del self.characters[user_id][character_id]
 
-      messages = self.openAIClient.beta.threads.messages.list(thread_id=thread.id, limit=5)
-      # Find the latest assistant message
-      assistant_reply = None
-      for msg in messages.data:
-        if msg.role == "assistant":
-          assistant_reply = msg.content[0].text.value if msg.content else ""
-          break
+    await interaction.response.send_message(f"✅ 角色 `{character_id}` 已刪除。", ephemeral=True)
 
-      if not assistant_reply:
-        del save['players'][user_id]
-        await interaction.followup.send("❌ 加入進度失敗：沒有收到 AI 回覆。")
-        return
+  async def list_characters(self, interaction: discord.Interaction):
+    if interaction.channel.id != CHANNEL_ID:
+      await interaction.response.send_message("請在gpt-trpg頻道使用此指令.", ephemeral=True)
+      return
 
-      self.playing[user_id] = session_name
-      character_save['state'] = CharacterCreationState.CHARACTER_CREATION
-      await interaction.followup.send(f"「{message}」\n\n✅ `{user_name}` 已加入進度 `{session_name}`\n\n**遊戲敘事:**\n{assistant_reply}")
-    except Exception as e:
-      del save['players'][user_id]
-      await interaction.followup.send(f"❌ 加入進度失敗：發生錯誤: {e}")
-      traceback.print_exc()
+    user_id = str(interaction.user.id)
+    if user_id not in self.characters or not self.characters[user_id]:
+      await interaction.response.send_message("目前沒有任何角色。", ephemeral=True)
+      return
+    
+    msg = "目前角色列表：\n"
+    for character_id, character in self.characters[user_id].items():
+      name = ""
+      if character['state'] == CharacterCreationState.NOT_STARTED:
+        name = "初始化中"
+      elif character['state'] == CharacterCreationState.CHARACTER_CREATION:
+        name = "創角中"
+      elif character['state'] == CharacterCreationState.CREATED:
+        name = character['data']['name'] if 'data' in character and 'name' in character['data'] else "角色資料毀損"
+      msg += f"• {character_id}: {name}\n"
+
+    await interaction.response.send_message(msg, ephemeral=True)
+
+  async def character_info(self, interaction: discord.Interaction, character_id: str):
+    if interaction.channel.id != CHANNEL_ID:
+      await interaction.response.send_message("請在gpt-trpg頻道使用此指令.", ephemeral=True)
+      return
+
+    user_id = str(interaction.user.id)
+    if user_id not in self.characters or character_id not in self.characters[user_id]:
+      await interaction.response.send_message(f"❌ 角色 `{character_id}` 不存在或未創建。", ephemeral=True)
+      return
+    
+    character = self.characters[user_id][character_id]
+    if character['state'] == CharacterCreationState.NOT_STARTED or character['state'] == CharacterCreationState.CHARACTER_CREATION:
+      await interaction.response.send_message(f"❌ 角色 `{character_id}` 尚未創建完成。", ephemeral=True)
+      return
+
+    await interaction.response.send_message(f"**角色 `{character_id}` 的資訊：**\n\n{character['data']}", ephemeral=True)
+
+  async def join(self, interaction: discord.Interaction, session_id: str, character_id: str = None, message: str = None):
+    if interaction.channel.id != CHANNEL_ID:
+      await interaction.response.send_message("請在gpt-trpg頻道使用此指令.", ephemeral=True)
+      return
+
+    if session_id not in self.saves:
+      await interaction.response.send_message(f"❌ 進度 `{session_id}` 不存在.")
+      return
+
+    if self.saves[session_id]['state'] == SessionState.NOT_STARTED:
+      await interaction.response.send_message(f"❌ 進度 `{session_id}` 創建中，請稍候。")
+      return
+
+    if self.saves[session_id]['state'] == SessionState.ENDED:
+      await interaction.response.send_message(f"❌ 進度 `{session_id}` 已結束，無法加入。")
+      return
+    
+    save = self.saves[session_id]
+    user_id = str(interaction.user.id)
+    user_name = str(interaction.user.name)
+
+    if user_id in save['players']:
+      self.player_state[user_id] = {
+        'state': PlayerState.JOINED,
+        'session_id': session_id,
+      }
+      await interaction.response.send_message(f"✅ 已切換至進度 `{session_id}` 。", ephemeral=True)
+      return
+
+    if character_id is None:
+      await interaction.response.send_message("請提供角色ID。", ephemeral=True)
+      return
+
+    if user_id not in self.characters or character_id not in self.characters[user_id]:
+      await interaction.response.send_message(f"❌ 角色 `{character_id}` 不存在，請先創建角色。", ephemeral=True)
+      return
+    
+    if self.characters[user_id][character_id]['state'] != CharacterCreationState.CREATED:
+      await interaction.response.send_message(f"❌ 角色 `{character_id}` 尚未創建完成，請先完成創建角色。。", ephemeral=True)
+      return
+    
+    save['players'][user_id] = {
+      'character_id': character_id,
+    }
+    character_data = self.characters[user_id][character_id]['data']
+    main_assistant_id = save['assistant_id']
+    thread_id = save['thread_id']
+
+    await interaction.response.defer()
+
+    if not message:
+      message = CHARACTER_CREATION_INTRO[random.randint(0, len(CHARACTER_CREATION_INTRO) - 1)]
+
+    self.message_queue[session_id].append({
+        'interaction': interaction,
+        'messages': [
+          f"System\n{user_id}使用以下角色加入遊戲：\n{json.dumps(character_data, ensure_ascii=False, indent=2)}",
+          f"User ID:{user_id}\n{message}",
+        ],
+        'response_prefix': f"**玩家{user_name}使用{character_data['name']}加入遊戲：{message}**",
+      }
+    )
+    await self.process_message_queue(session_id)
+    self.player_state[user_id] = {
+      'state': PlayerState.JOINED,
+      'session_id': session_id,
+    }
 
   async def play(self, interaction: discord.Interaction, message: str):
     if interaction.channel.id != CHANNEL_ID:
       await interaction.response.send_message("請在gpt-trpg頻道使用此指令.", ephemeral=True)
       return
 
-    user_id = interaction.user.id
-    user_name = interaction.user.name
-    if user_id not in self.playing:
-      await interaction.response.send_message("❌ 你尚未加入任何遊玩進度. 請用 `/join` 加入進度.", ephemeral=True)
+    user_id = str(interaction.user.id)
+    user_name = str(interaction.user.name)
+    if user_id not in self.player_state or self.player_state[user_id]['state'] == PlayerState.NOT_STARTED:
+      await interaction.response.send_message("❌ 尚未開始互動. 請用 `/join` 加入進度或使用 `/create` 創建角色.", ephemeral=True)
       return
 
     await interaction.response.defer()
 
-    session_name = self.playing[user_id]
-    session = self.saves[session_name]
-    if session['players'][user_id]['state'] == CharacterCreationState.CHARACTER_CREATION:
-      player_data = session['players'][user_id]
-      thread_id = player_data['character_creation']['thread_id']
-      assistant_id = player_data['character_creation']['assistant_id']
+    if self.player_state[user_id]['state'] == PlayerState.CHARACTER_CREATION:
+      character_id = self.player_state[user_id]['character_id']
+      assistant_id = self.characters[user_id][character_id]['assistant_id']
+      thread_id = self.characters[user_id][character_id]['thread_id']
 
+      assistant_reply, error = self.run_and_fetch_thread_response(thread_id, assistant_id, message)
+      if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+
+      if "START_OF_CHARACTER" in assistant_reply and "END_OF_CHARACTER" in assistant_reply:
+        message_index = assistant_reply.find("START_OF_CHARACTER")
+        start_index = message_index + len("START_OF_CHARACTER")
+        end_index = assistant_reply.find("END_OF_CHARACTER")
+
+        assistant_message = assistant_reply[:message_index].strip()
+        character_data_json = assistant_reply[start_index:end_index].strip()
+        try:
+          character = self.characters[user_id][character_id]
+          character['data'] = json.loads(character_data_json)
+          character['state'] = CharacterCreationState.CREATED
+          del character['assistant_id']
+          del character['thread_id'] 
+          self.player_state[user_id]['state'] = PlayerState.NOT_STARTED
+          if assistant_message:
+            assistant_message = f"**遊戲敘事**：{assistant_message}\n\n"
+          await interaction.followup.send(f"{assistant_message}✅ 角色 `{character_id}` 創建完成！\n**角色資料：**\n{self.characters[user_id][character_id]['data']}")
+        except json.JSONDecodeError as e:
+          await interaction.followup.send(f"❌ 無法解析角色數據，創建角色失敗：{e}", ephemeral=True)
+          traceback.print_exc()
+        return
+      
+      await interaction.followup.send(f"**玩家{user_name}輸入:**\n{message}\n\n**遊戲敘事:**\n{assistant_reply}")
+    
+    elif self.player_state[user_id]['state'] == PlayerState.JOINED:
+      session_id = self.player_state[user_id]['session_id']
+      self.message_queue[session_id].append({
+        'interaction': interaction,
+        'messages': [
+          f"User ID:{user_id}\n{message}",
+        ],
+        'response_prefix': f"**玩家{user_name}輸入:**\n{message}",
+      })
+      await self.process_message_queue(session_id)
+
+  async def status(self, interaction: discord.Interaction):
+    if interaction.channel.id != CHANNEL_ID:
+      await interaction.response.send_message("請在gpt-trpg頻道使用此指令.", ephemeral=True)
+      return
+    
+    user_id = str(interaction.user.id)
+    if user_id not in self.player_state or self.player_state[user_id]['state'] == PlayerState.NOT_STARTED:
+      await interaction.response.send_message("目前狀態：尚未開始互動", ephemeral=True)
+      return
+    
+    if self.player_state[user_id]['state'] == PlayerState.CHARACTER_CREATION:
+      character_id = self.player_state[user_id].get('character_id')
+      await interaction.response.send_message(f"目前狀態：創建角色 `{character_id}` 中", ephemeral=True)
+      return
+    
+    if self.player_state[user_id]['state'] == PlayerState.JOINED:
+      session_id = self.player_state[user_id].get('session_id')
+      await interaction.response.send_message(f"目前狀態：已加入進度 `{session_id}`", ephemeral=True)
+      return
+    
+    await interaction.response.send_message("目前狀態：未知", ephemeral=True)
+
+  def run_and_fetch_thread_response(self, thread_id: str, assistant_id: str, message: str) -> (str, str):
+    try:
       self.openAIClient.beta.threads.messages.create(
         thread_id=thread_id,
         role="user",
@@ -393,8 +609,8 @@ class GPTTRPG(discord.Client):
         time.sleep(1)
 
       if run_status.status != "completed":
-        await interaction.response.send(f"❌ Bot錯誤. 狀態: {run_status.status}", ephemeral=True)
-        return
+        traceback.print_exc()
+        return None, f"❌ Bot錯誤. 狀態: {run_status.status}"
 
       messages = self.openAIClient.beta.threads.messages.list(thread_id=thread_id, limit=5)
       assistant_reply = None
@@ -404,43 +620,49 @@ class GPTTRPG(discord.Client):
           break
 
       if not assistant_reply:
-        await interaction.response.send("❌ 沒有收到 AI 回覆。", ephemeral=True)
-        return
+        traceback.print_exc()
+        return None, f"❌ 沒有收到 AI 回覆。"
 
-      # if first line of assistant reply is "Character_Creation_Complete", send the character data to main
-      if assistant_reply.startswith("Character_Creation_Complete\n"):
-        character_data = assistant_reply[len("Character_Creation_Complete\n"):]
-        session['players'][user_id]['state'] = CharacterCreationState.JOINED
-        self.message_queue[session_name].append((interaction, f"System\n{user_id}加入遊戲，角色：\n{character_data}"))
-      else:
-        await interaction.response.send(f"**玩家{user_name}輸入:**\n{message}\n\n**遊戲敘事:**\n{assistant_reply}")
-        return
-    
-    if session['players'][user_id]['state'] == CharacterCreationState.JOINED:
-      self.message_queue[session_name].append((interaction, f"User ID:{user_id}\n{message}"))
+      return assistant_reply, None
+    except Exception as e:
+      traceback.print_exc()
+      return None, f"❌ 發生錯誤: {e}"
 
-    if not self.message_queue[session_name]:
+  async def process_message_queue(self, session_id: str):
+    if session_id not in self.message_queue or not self.message_queue[session_id]:
       return
 
-    with self.processing_lock[session_name]:
-      if self.processing[session_name]:
-        await interaction.response.defer()
-        return
-      self.processing[session_name] = True
+    if session_id not in self.saves:
+      print(f"[Error] Session {session_id} not found in saves.")
+      return
+    session = self.saves[session_id]
 
-    while self.message_queue[session_name]:
-      current_interaction, current_message = self.message_queue[session_name].pop(0)
+    with self.processing_lock[session_id]:
+      if self.processing[session_id]:
+        return
+      self.processing[session_id] = True
+
+    while self.message_queue[session_id]:
+      payload = self.message_queue[session_id][0]
+      current_interaction = payload['interaction']
+      current_messages = payload['messages']
+      current_response_prefix = payload.get('response_prefix', "")
+
       thread_id = session['thread_id']
       assistant_id = session['assistant_id']
 
-      user_name = current_interaction.user.name
       try:
-        self.openAIClient.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=f"User ID: {user_name}\n{current_message}",
-        )
+        for message in current_messages:
+          self.openAIClient.beta.threads.messages.create(
+              thread_id=thread_id,
+              role="user",
+              content=message,
+          )
+      except Exception as e:
+        await current_interaction.followup.send(f"❌ 發生錯誤: {e}")
+      self.message_queue[session_id].popleft()
 
+      try:
         run = self.openAIClient.beta.threads.runs.create(
             thread_id=thread_id,
             assistant_id=assistant_id,
@@ -471,41 +693,64 @@ class GPTTRPG(discord.Client):
           await current_interaction.followup.send("❌ 沒有收到 AI 回覆。")
           continue
 
-        await current_interaction.followup.send(f"**玩家{user_name}輸入:**\n{current_message}\n\n**遊戲敘事:**\n{assistant_reply}")
+        await current_interaction.followup.send(f"{current_response_prefix}\n\n**遊戲敘事:**\n{assistant_reply}")
       except Exception as e:
         await current_interaction.followup.send(f"❌ 發生錯誤: {e}")
 
-    self.processing[session_name] = False
+    self.processing[session_id] = False
 
 
 client = GPTTRPG()
 
-@client.tree.command(name="create", description="創建新的遊玩進度")
-@app_commands.describe(session_name="進度名稱", scenario_id="劇本ID(留空則使用自由劇本)")
-async def create(interaction: discord.Interaction, session_name: str, scenario_id: str = None):
-  await client.create(interaction, session_name, scenario_id)
+@client.tree.command(name="start_game", description="創建新的遊玩進度")
+@app_commands.describe(session_id="進度名稱", scenario_id="劇本ID(留空則使用自由劇本)")
+async def start_game(interaction: discord.Interaction, session_id: str, scenario_id: str = None):
+  await client.start_game(interaction, session_id, scenario_id)
 
 @client.tree.command(name="list_sessions", description="顯示所有進度")
 async def list_sessions(interaction: discord.Interaction):
   await client.list_sessions(interaction)
 
-@client.tree.command(name="summary", description="觀看進度摘要")
-@app_commands.describe(session_name="進度名稱")
-async def summary(interaction: discord.Interaction, session_name: str):
-  await client.summary(interaction, session_name)
+@client.tree.command(name="session_summary", description="觀看進度摘要")
+@app_commands.describe(session_id="進度名稱")
+async def session_summary(interaction: discord.Interaction, session_id: str):
+  await client.summary(interaction, session_id)
 
-@client.tree.command(name="join", description="加入遊玩進度，如果是第一次加入則會進入創角流程")
-@app_commands.describe(session_name="進度名稱", message="創角開場白。僅第一次加入時有用。留空則會隨機產生")
-async def join(interaction: discord.Interaction, session_name: str, message: str = None):
-  await client.join(interaction, session_name, message)
+@client.tree.command(name="create_character", description="創建角色")
+@app_commands.describe(character_id="角色ID", message="創角開場白。留空則會隨機產生")
+async def create_character(interaction: discord.Interaction, character_id: str, message: str = None):
+  await client.create_character(interaction, character_id, message)
+
+@client.tree.command(name="list_characters", description="列出所有角色")
+async def list_characters(interaction: discord.Interaction):
+  await client.list_characters(interaction)
+
+@client.tree.command(name="delete_character", description="刪除角色")
+@app_commands.describe(character_id="角色ID")
+async def delete_character(interaction: discord.Interaction, character_id: str):
+  await client.delete_character(interaction, character_id)
+
+@client.tree.command(name="character_info", description="查看角色資訊")
+@app_commands.describe(character_id="角色ID")
+async def character_info(interaction: discord.Interaction, character_id: str):
+  await client.character_info(interaction, character_id)
+
+@client.tree.command(name="join", description="使用角色加入遊玩進度")
+@app_commands.describe(session_id="進度名稱", character_id="角色ID，重新加入時可留空", message="加入開場白。留空則會隨機產生")
+async def join(interaction: discord.Interaction, session_id: str, character_id: str = None, message: str = None):
+  await client.join(interaction, session_id, character_id, message)
 
 @client.tree.command(name="play", description="與敘事 AI 互動")
 @app_commands.describe(message="輸入你的角色行動或對話")
 async def play(interaction: discord.Interaction, message: str):
   await client.play(interaction, message)
 
-@client.tree.command(name="scenario_list", description="列出所有劇本")
-async def scenario_list(interaction: discord.Interaction):
+@client.tree.command(name="status", description="查看玩家狀態")
+async def status(interaction: discord.Interaction):
+  await client.status(interaction)
+
+@client.tree.command(name="list_scenarios", description="列出所有劇本")
+async def list_scenarios(interaction: discord.Interaction):
   if interaction.channel.id != CHANNEL_ID:
     await interaction.response.send_message("請在gpt-trpg頻道使用此指令.", ephemeral=True)
     return
@@ -574,3 +819,4 @@ async def save(interaction: discord.Interaction):
     await interaction.response.send_message(f"❌ 保存進度失敗：{e}")
 
 client.run(DISCORD_TOKEN)
+random.seed(time.time())
