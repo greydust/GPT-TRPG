@@ -11,6 +11,7 @@ import threading
 import traceback
 from collections import deque
 import random
+import io
 
 
 config = configparser.ConfigParser()
@@ -44,8 +45,9 @@ RULE_SET = {
   }
 }
 
-SAVES_FILE = "saves.json"
-CHARACTER_FOLDER = "characters"
+SAVES_FILE = 'saves.json'
+CHARACTER_FOLDER = 'characters'
+SESSION_FOLDER = 'sessions'
 SUMMARY_THRESHOLD_TOKEN = 10000
 
 CHARACTER_CREATION_INTRO = [
@@ -150,10 +152,10 @@ atexit.register(save_saves)
 class GPTTRPG(discord.Client):
   def __init__(self):
     super().__init__(intents=discord.Intents.default())
+    self.openAIClient = OpenAI(api_key=OPENAI_API_KEY)
     self.tree = app_commands.CommandTree(self)
     self.saves, self.characters = load_saves()
     self.player_state = {}
-    self.openAIClient = OpenAI(api_key=OPENAI_API_KEY)
     self.message_queue = {session_id: deque() for session_id in self.saves.keys()}
     self.processing = {session_id: False for session_id in self.saves.keys()}
     self.processing_lock = {session_id: threading.Lock() for session_id in self.saves.keys()}
@@ -191,13 +193,46 @@ class GPTTRPG(discord.Client):
             name=assistant_name,
             model="gpt-4-turbo",
             metadata=metadata,
-            instructions=instructions
+            instructions=instructions,
+            tools=[{"type": "file_search"}],
           )
           self.rule_set[key]['assistant_id'] = response.id
           print(f"[Debug] Created assistant '{assistant_name}' with metadata {metadata}.")
     except Exception as e:
       print(f"[Error] During assistant setup: {e}")
       traceback.print_exc()
+
+  def sync_characters(self):
+    for user_id, characters in self.characters.items():
+      for character_id, character in characters.items():
+        self.sync_character(user_id, character_id)
+
+  def sync_character(self, user_id: str, character_id: str, refresh: bool = False) -> str:
+    if user_id not in self.characters or character_id not in self.characters[user_id]:
+      print(f"[Debug] No character data found for {user_id}: {character_id}")
+      return
+
+    character = self.characters[user_id][character_id]
+
+    if character['state'] != CharacterCreationState.CREATED:
+      print(f"[Debug] Character {character_id} for user {user_id} is created yet. State: {character['state']}")
+      return
+    
+    if 'file_id' not in character or refresh:
+      print(f"[Debug] Syncing character file for {user_id}: {character_id}")
+      file_io = io.BytesIO(json.dumps(character['data'], ensure_ascii=False, indent=2).encode('utf-8'))
+      file_io.name = f"CHARACTER_{user_id}_{character_id}.json"
+      try:
+        response = self.openAIClient.files.create(
+          file=file_io,
+          purpose="assistants",
+        )
+        character['file_id'] = response.id
+      except Exception as e:
+        print(f"[Error] Failed to upload character file for {user_id}: {character_id}: {e}")
+        traceback.print_exc()
+    
+    return character['file_id']
 
   async def start_game(self, interaction: discord.Interaction, session_id: str, scenario_id: str = None):
     if interaction.channel.id != CHANNEL_ID:
@@ -210,7 +245,7 @@ class GPTTRPG(discord.Client):
 
     self.saves[session_id] = {
       'scenario_id': scenario_id,
-      'summary': '',
+      'summaries': [],
       'players': {},
       'state': SessionState.NOT_STARTED,
       'rule_set': self.rule_set['main']['rule_set'],
@@ -244,7 +279,6 @@ class GPTTRPG(discord.Client):
       self.openAIClient.beta.threads.messages.create(
         thread_id=thread.id,
         role="user",
-        content=system_message
       )
       run = self.openAIClient.beta.threads.runs.create(
           thread_id=thread.id,
@@ -309,12 +343,19 @@ class GPTTRPG(discord.Client):
       await interaction.response.send_message(f"❌ 進度 `{session_id}` 不存在.")
       return
 
-    summary = self.saves[session_id]['summary']
-    if not summary:
+    summaries = self.saves[session_id]['summaries']
+    if not summaries:
       await interaction.response.send_message(f"❌ 進度 `{session_id}` 尚無摘要。")
       return
-
-    await interaction.response.send_message(f"**進度 `{session_id}` 的摘要：**\n\n{summary}")
+    
+    latest_summary = summaries[-1]
+    file_path = os.path.join(SESSION_FOLDER, session_id, f"{lastest_summary['file_name']}.txt")
+    if not os.path.exists(file_path):
+      await interaction.response.send_message(f"❌ 找不到進度 `{session_id}` 的摘要檔案。")
+      return
+    
+    with open(file_path, "r", encoding="utf-8") as f:
+      await interaction.response.send_message(f"**進度 `{session_id}` 的最新摘要：**\n\n{f.read()}")
 
   async def create_character(self, interaction: discord.Interaction, character_id: str, message: str = None):
     if interaction.channel.id != CHANNEL_ID:
@@ -478,7 +519,8 @@ class GPTTRPG(discord.Client):
     if self.characters[user_id][character_id]['state'] != CharacterCreationState.CREATED:
       await interaction.response.send_message(f"❌ 角色 `{character_id}` 尚未創建完成，請先完成創建角色。。", ephemeral=True)
       return
-    
+
+    character_file_id = self.sync_character(user_id, character_id)
     save['players'][user_id] = {
       'character_id': character_id,
     }
@@ -498,6 +540,7 @@ class GPTTRPG(discord.Client):
           f"User ID:{user_id}\n{message}",
         ],
         'response_prefix': f"**玩家{user_name}使用{character_data['name']}加入遊戲：{message}**",
+        'attachments': [{'file_id': data, 'tools': [{'type': 'file_search'}]} for data in [character_file_id] if data is not None],
       }
     )
     await self.process_message_queue(session_id)
@@ -536,9 +579,10 @@ class GPTTRPG(discord.Client):
 
         assistant_message = assistant_reply[:message_index].strip()
         character_data_json = assistant_reply[start_index:end_index].strip()
+        character = self.characters[user_id][character_id]
         try:
-          character = self.characters[user_id][character_id]
-          character['data'] = json.loads(character_data_json)
+          character_data = json.loads(character_data_json)
+          character['data'] = character_data
           character['state'] = CharacterCreationState.CREATED
           del character['assistant_id']
           del character['thread_id'] 
@@ -586,17 +630,18 @@ class GPTTRPG(discord.Client):
     
     await interaction.response.send_message("目前狀態：未知", ephemeral=True)
 
-  def run_and_fetch_thread_response(self, thread_id: str, assistant_id: str, message: str) -> (str, str):
+  def run_and_fetch_thread_response(self, thread_id: str, assistant_id: str, message: str, attachments: list = []) -> (str, str):
     try:
       self.openAIClient.beta.threads.messages.create(
         thread_id=thread_id,
         role="user",
-        content=message
+        content=message,
+        attachments=attachments
       )
 
       run = self.openAIClient.beta.threads.runs.create(
         thread_id=thread_id,
-        assistant_id=assistant_id
+        assistant_id=assistant_id,
       )
 
       while True:
@@ -647,6 +692,7 @@ class GPTTRPG(discord.Client):
       current_interaction = payload['interaction']
       current_messages = payload['messages']
       current_response_prefix = payload.get('response_prefix', "")
+      attachments = payload.get('attachments', [])
 
       thread_id = session['thread_id']
       assistant_id = session['assistant_id']
@@ -657,6 +703,7 @@ class GPTTRPG(discord.Client):
               thread_id=thread_id,
               role="user",
               content=message,
+              attachments=attachments
           )
       except Exception as e:
         await current_interaction.followup.send(f"❌ 發生錯誤: {e}")
@@ -694,11 +741,85 @@ class GPTTRPG(discord.Client):
           continue
 
         await current_interaction.followup.send(f"{current_response_prefix}\n\n**遊戲敘事:**\n{assistant_reply}")
+
+        if run_status.usage.total_tokens > SUMMARY_THRESHOLD_TOKEN:
+          self.summary_session(session_id)
       except Exception as e:
         await current_interaction.followup.send(f"❌ 發生錯誤: {e}")
 
     self.processing[session_id] = False
 
+  def summary_session(self, session_id: str):
+    if session_id not in self.saves:
+      print(f"[Error] Session {session_id} not found in saves.")
+      return
+    
+    session = self.saves[session_id]
+    if session['state'] != SessionState.STARTED:
+      print(f"[Error] Session {session_id} is not in a valid state for summarization.")
+      return
+    
+    thread_id = session['thread_id']
+    assistant_id = session['assistant_id']
+    current_summary, error = self.run_and_fetch_thread_response(thread_id, assistant_id, "請以五百字內總結目前遊戲進度。回覆不需要使用命運引言，只需要完整敘述目前遊戲進度的摘要即可。")
+    if error:
+      print(f"[Error] Failed to summarize session {session_id}: {error}")
+      return
+    
+    summary_name = f"Chapter {len(session['summaries']) + 1}"
+    summary_file_name = f"{summary_name}.txt"
+    with open(os.path.join(SESSION_FOLDER, session_id, summary_file_name), "w", encoding="utf-8") as f:
+      f.write(current_summary)
+    session['summaries'].append({
+      'name': summary_name,
+      'file_name': summary_file_name,
+    })
+    summary = session['summaries'][-1]
+
+    file_io = io.BytesIO(current_summary.encode('utf-8'))
+    file_io.name = f"SUMMARY_{session_id}_{summary_name}.txt"
+    try:
+      response = self.openAIClient.files.create(
+        file=file_io,
+        purpose="assistants",
+      )
+      summary['file_id'] = response.id
+    except Exception as e:
+      print(f"[Error] Failed to upload summary file for session {session_id}: {e}")
+      traceback.print_exc()
+
+    scenario_id = session['scenario_id']
+    scenario_content = "無劇本"
+    if scenario_id:
+      scenarios_dir = os.path.join(os.path.dirname(__file__), "scenarios")
+      file_path = os.path.join(scenarios_dir, f"{scenario_id}.md")
+      if not os.path.exists(file_path):
+        print(f"[Error] Scenario file for {scenario_id} not found.")
+        return
+      with open(file_path, "r", encoding="utf-8") as f:
+        scenario_content = f.read()
+    
+    # get all file_ids from summaries and characters
+    attachments = [
+      {'file_id': file['file_id'], 'tools': [{'type': 'file_search'}]}
+      for file in session['summaries'] + session['players']
+      if 'file_id' in file
+    ]
+    try:
+      thread = self.openAIClient.beta.threads.create(
+        messages=[
+          {
+            'content': f"System\n劇本：{scenario_content}\n\n目前摘要：{current_summary}",
+            'role': 'user',
+            'attachments': attachments,
+          }
+        ],
+      )
+      session['thread_id'] = thread.id
+    except Exception as e:
+      print(f"[Error] Failed to create summary thread for session {session_id}: {e}")
+      traceback.print_exc()
+      return
 
 client = GPTTRPG()
 
