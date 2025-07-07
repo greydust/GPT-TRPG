@@ -48,7 +48,7 @@ RULE_SET = {
 SAVES_FILE = 'saves.json'
 CHARACTER_FOLDER = 'characters'
 SESSION_FOLDER = 'sessions'
-SUMMARY_THRESHOLD_TOKEN = 10000
+SUMMARY_THRESHOLD_TOKEN = 20000
 
 CHARACTER_CREATION_INTRO = [
   "從霧氣瀰漫的狹海彼岸，命運的長路悄然展開。",
@@ -522,11 +522,12 @@ class GPTTRPG(discord.Client):
       return
 
     character_file_id = self.sync_character(user_id, character_id)
+    character_data = self.characters[user_id][character_id]['data']
     save['players'][user_id] = {
       'character_id': character_id,
+      'character_name': character_data['name'],
       'file_id': character_file_id,
     }
-    character_data = self.characters[user_id][character_id]['data']
     main_assistant_id = save['assistant_id']
     thread_id = save['thread_id']
 
@@ -804,15 +805,23 @@ class GPTTRPG(discord.Client):
     # get all file_ids from summaries and characters
     attachments = [
       {'file_id': file['file_id'], 'tools': [{'type': 'file_search'}]}
-      for file in session['summaries'] + session['players']
+      for file in session['summaries']
       if 'file_id' in file
+    ] + [
+      {'file_id': player['file_id'], 'tools': [{'type': 'file_search'}]}
+      for player in session['players'].values()
+      if 'file_id' in player
     ]
+
+    controlling_characters = ""
+    for player_id, player in session['players'].items():
+      controlling_characters += f"{player_id} 控制角色 {player['character_name']}\n"
 
     try:
       thread = self.openAIClient.beta.threads.create(
         messages=[
           {
-            'content': f"System\n劇本：{scenario_content}\n\n目前摘要：{current_summary}",
+            'content': f"System\n劇本：{scenario_content}\n\n目前摘要：{current_summary}\n\n{controlling_characters}",
             'role': 'user',
             'attachments': attachments,
           }
