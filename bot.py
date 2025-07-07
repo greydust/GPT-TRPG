@@ -341,18 +341,18 @@ class GPTTRPG(discord.Client):
       return
 
     if session_id not in self.saves:
-      await interaction.response.send_message(f"❌ 進度 `{session_id}` 不存在.")
+      await interaction.response.send_message(f"❌ 進度 `{session_id}` 不存在.", ephemeral=True)
       return
 
     summaries = self.saves[session_id]['summaries']
     if not summaries:
-      await interaction.response.send_message(f"❌ 進度 `{session_id}` 尚無摘要。")
+      await interaction.response.send_message(f"❌ 進度 `{session_id}` 尚無摘要。", ephemeral=True)
       return
     
     latest_summary = summaries[-1]
-    file_path = os.path.join(SESSION_FOLDER, session_id, f"{lastest_summary['file_name']}.txt")
+    file_path = os.path.join(SESSION_FOLDER, session_id, f"{latest_summary['file_name']}")
     if not os.path.exists(file_path):
-      await interaction.response.send_message(f"❌ 找不到進度 `{session_id}` 的摘要檔案。")
+      await interaction.response.send_message(f"❌ 找不到進度 `{session_id}` 的摘要檔案。", ephemeral=True)
       return
     
     with open(file_path, "r", encoding="utf-8") as f:
@@ -745,6 +745,7 @@ class GPTTRPG(discord.Client):
 
         await current_interaction.followup.send(f"{current_response_prefix}\n\n**遊戲敘事:**\n{assistant_reply}")
 
+        print(f"[Debug] Total tokens used: {run_status.usage.total_tokens}\n")
         if run_status.usage.total_tokens > SUMMARY_THRESHOLD_TOKEN:
           self.summary_session(session_id)
       except Exception as e:
@@ -847,7 +848,7 @@ async def list_sessions(interaction: discord.Interaction):
 @client.tree.command(name="session_summary", description="觀看進度摘要")
 @app_commands.describe(session_id="進度名稱")
 async def session_summary(interaction: discord.Interaction, session_id: str):
-  await client.summary(interaction, session_id)
+  await client.session_summary(interaction, session_id)
 
 @client.tree.command(name="create_character", description="創建角色")
 @app_commands.describe(character_id="角色ID", message="創角開場白。留空則會隨機產生")
