@@ -279,6 +279,7 @@ class GPTTRPG(discord.Client):
       self.openAIClient.beta.threads.messages.create(
         thread_id=thread.id,
         role="user",
+        content=system_message,
       )
       run = self.openAIClient.beta.threads.runs.create(
           thread_id=thread.id,
@@ -523,6 +524,7 @@ class GPTTRPG(discord.Client):
     character_file_id = self.sync_character(user_id, character_id)
     save['players'][user_id] = {
       'character_id': character_id,
+      'file_id': character_file_id,
     }
     character_data = self.characters[user_id][character_id]['data']
     main_assistant_id = save['assistant_id']
@@ -805,6 +807,7 @@ class GPTTRPG(discord.Client):
       for file in session['summaries'] + session['players']
       if 'file_id' in file
     ]
+
     try:
       thread = self.openAIClient.beta.threads.create(
         messages=[
